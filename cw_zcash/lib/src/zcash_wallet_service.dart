@@ -26,11 +26,11 @@ class ZcashWalletService
   static int dbMutexQueue = 0;
   static Future<T> runInDbMutex<T>(final Future<T> Function() call) async {
     try {
-      printV("dbMutexQueue: ${dbMutexQueue++}");
-      await dbMutex.acquire();
+      // printV("dbMutexQueue: ${dbMutexQueue++}");
+      // await dbMutex.acquire();
       return await call();
     } finally {
-      dbMutex.release();
+      // dbMutex.release();
       dbMutexQueue--;
     }
   }

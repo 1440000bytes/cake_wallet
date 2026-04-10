@@ -5,8 +5,8 @@ import 'package:cw_core/wallet_addresses.dart';
 import 'package:cw_core/wallet_info.dart';
 import 'package:cw_zcash/cw_zcash.dart';
 import 'package:cw_zcash/src/zcash_taddress_rotation.dart';
+import 'package:cw_zcash/src/warp_api_compat/legacy.dart';
 import 'package:mobx/mobx.dart';
-import 'package:warp_api/warp_api.dart';
 
 part 'zcash_wallet_addresses.g.dart';
 
@@ -52,8 +52,11 @@ abstract class ZcashWalletAddressesBase extends WalletAddresses with Store {
       case ZcashAddressType.shieldedOrchard:
         return orchardAddress;
       case ZcashAddressType.unifiedType:
-        if (_unifiedAddress == null) {
-          _unifiedAddress = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 6);
+        if ((_unifiedAddress ?? '').isEmpty) {
+          final latest = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 6);
+          if (latest.isNotEmpty) {
+            _unifiedAddress = latest;
+          }
         }
         return _unifiedAddress ?? "";
     }
@@ -81,8 +84,11 @@ abstract class ZcashWalletAddressesBase extends WalletAddresses with Store {
 
   String get transparentAddress {
     try {
-      if (_transparentAddress == null) {
-        _transparentAddress = WarpApi.getTAddr(ZcashWalletBase.coin, accountId);
+      if ((_transparentAddress ?? '').isEmpty) {
+        final latest = WarpApi.getTAddr(ZcashWalletBase.coin, accountId);
+        if (latest.isNotEmpty) {
+          _transparentAddress = latest;
+        }
       }
       return _transparentAddress ?? "";
     } catch (e) {
@@ -101,23 +107,35 @@ abstract class ZcashWalletAddressesBase extends WalletAddresses with Store {
 
   String get saplingAddress {
     try {
-      if (_saplingAddress == null) {
-        _saplingAddress = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 2);
+      if ((_saplingAddress ?? '').isEmpty) {
+        final latest = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 2);
+        if (latest.isNotEmpty) {
+          _saplingAddress = latest;
+        }
       }
-      return _saplingAddress ?? "";
+      if ((_saplingAddress ?? '').isNotEmpty) {
+        return _saplingAddress!;
+      }
+      return "unknown";
     } catch (e) {
-      return "";
+      return "$e";
     }
   }
 
   String get orchardAddress {
     try {
-      if (_orchardAddress == null) {
-        _orchardAddress = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 4);
+      if ((_orchardAddress ?? '').isEmpty) {
+        final latest = WarpApi.getAddress(ZcashWalletBase.coin, accountId, 4);
+        if (latest.isNotEmpty) {
+          _orchardAddress = latest;
+        }
       }
-      return _orchardAddress ?? "";
+      if ((_orchardAddress ?? '').isNotEmpty) {
+        return _orchardAddress!;
+      }
+      return "unknown";
     } catch (e) {
-      return "";
+      return "$e";
     }
   }
 
@@ -151,6 +169,9 @@ abstract class ZcashWalletAddressesBase extends WalletAddresses with Store {
 
   @override
   Future<void> init() async {
+    await ZcashWalletService.runInDbMutex(
+      () => WarpApi.refreshAccountCache(ZcashWalletBase.coin, accountId),
+    );
     await _initAddresses();
 
     await ZcashTaddressRotation.init();
@@ -178,6 +199,8 @@ abstract class ZcashWalletAddressesBase extends WalletAddresses with Store {
       if (addr != null) {
         address = addr;
       }
+    } else {
+      address = latestAddress;
     }
     await saveAddressesInBox();
   }

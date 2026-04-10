@@ -107,6 +107,7 @@ class ZkoolSweep {
       transparentLimit: 100,
       checkpointAge: 200,
       c: c,
+      fast: true,
     );
     bool success = false;
     await sync.listen(

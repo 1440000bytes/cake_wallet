@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:cw_core/crypto_currency.dart';
@@ -11,7 +10,6 @@ import 'package:cw_core/sync_status.dart';
 import 'package:cw_core/transaction_direction.dart';
 import 'package:cw_core/transaction_priority.dart';
 import 'package:cw_core/utils/print_verbose.dart';
-import 'package:cw_core/utils/proxy_wrapper.dart';
 import 'package:cw_core/wallet_addresses.dart';
 import 'package:cw_core/wallet_base.dart';
 import 'package:cw_core/wallet_credentials.dart';
@@ -25,12 +23,10 @@ import 'package:cw_zcash/src/zcash_taddress_rotation.dart';
 import 'package:cw_zcash/src/zcash_wallet_addresses.dart';
 import 'package:flutter/foundation.dart';
 import 'package:mobx/mobx.dart';
-import 'package:warp_api/warp_api.dart';
-import 'package:warp_api/data_fb_generated.dart';
-import 'package:flutter/services.dart';
 import 'package:mutex/mutex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:cw_zcash/src/warp_api_compat/legacy.dart';
 
 part 'zcash_wallet.g.dart';
 
@@ -115,6 +111,8 @@ abstract class ZcashWalletBase
       }
       printV("Setting LWD URL to: $lwdUrl");
       WarpApi.updateLWD(coin, lwdUrl);
+      await ZcashWalletService.runInDbMutex(() => WarpApi.getLatestHeight(coin));
+      await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccountCache(coin, accountId));
       syncStatus = ConnectedSyncStatus();
       try {
         await updateBalance();
@@ -122,6 +120,7 @@ abstract class ZcashWalletBase
       } catch (e) {
         printV("Error updating balance/transactions after connect: $e");
       }
+      await startSync();
     } catch (e) {
       printV("Connection error: $e");
       syncStatus = FailedSyncStatus(error: e.toString());
@@ -206,7 +205,7 @@ abstract class ZcashWalletBase
         memo: memo.isNotEmpty ? memo : null,
       );
 
-      recipients.add(Recipient(builder.toBytes()));
+      recipients.add(Recipient.fromBytes(builder.toBytes()));
     }
 
     if (totalAmount > availableBalance) {
@@ -222,7 +221,6 @@ abstract class ZcashWalletBase
 
     // pools parameter: bitmask for which pools to use for sending
     // 1=Transparent, 2=Sapling, 4=Orchard, 7=All pools
-    await ZcashWalletBase.loadProver();
     // Using 7 (all pools) allows spending from any pool type
     final txPlan = await ZcashWalletService.runInDbMutex(
       () => WarpApi.prepareTx(
@@ -250,12 +248,8 @@ abstract class ZcashWalletBase
     final tx = (ZcashTaddressRotation.shieldedAccountsTx[accountId] ?? <ShieldedTx>[])
         .map((final v) {
           final unpacked = v.unpack();
-          unpacked.memo ??= "";
-          unpacked.memo = "${unpacked.memo}\n$_dispPhrase".trim();
-          final List<int> buff = base64.decode(
-            ZcashTaddressRotation.flatBuffersPack(unpacked.pack),
-          );
-          return ShieldedTx(buff);
+          unpacked.memo = "${unpacked.memo ?? ''}\n$_dispPhrase".trim();
+          return unpacked;
         })
         .where((final t) => t.value > 0);
 
@@ -272,6 +266,7 @@ abstract class ZcashWalletBase
   @override
   Future<Map<String, ZcashTransactionInfo>> fetchTransactions() async {
     await ZcashWalletService.loadShieldTxs();
+    await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccountCache(coin, accountId));
     final txs = (await ZcashWalletService.runInDbMutex(
       () => WarpApi.getTxs(coin, accountId),
     )).toList();
@@ -435,6 +430,7 @@ abstract class ZcashWalletBase
 
   Future<void> init() async {
     try {
+      await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccountCache(coin, accountId));
       await walletAddresses.init();
 
       await updateBalance();
@@ -487,6 +483,12 @@ abstract class ZcashWalletBase
   @override
   @action
   Future<void> startSync() async {
+    if (syncStatus is AttemptingSyncStatus ||
+        syncStatus is SyncronizingSyncStatus ||
+        syncStatus is SyncingSyncStatus ||
+        syncStatus is SyncedSyncStatus) {
+      return;
+    }
     try {
       syncStatus = AttemptingSyncStatus();
 
@@ -497,14 +499,7 @@ abstract class ZcashWalletBase
 
       syncStatus = SyncronizingSyncStatus();
 
-      unawaited(
-        _runWarpSync().catchError((final e) {
-          isNodeWorking = false;
-          printV("WarpSync error in startSync: $e");
-          syncStatus = FailedSyncStatus(error: e.toString());
-          _stopSyncStatusUpdates();
-        }),
-      );
+      await _runWarpSync();
     } catch (e) {
       isNodeWorking = false;
       printV("Sync error: $e");
@@ -520,11 +515,11 @@ abstract class ZcashWalletBase
     final zcashDir = await pathForWalletTypeDir(type: WalletType.zcash);
     final zcashInitialSync = File(p.join(zcashDir, ".initial-sync-marker"));
     if (!zcashInitialSync.existsSync()) {
-      int chainHeight = 3000000; // fallback if node is offline
+      int chainHeight = await getBlockHeightByTime(DateTime.now()); // offline fallback
       try {
         chainHeight = await WarpApi.getLatestHeight(coin);
       } catch (e) {
-        printV("Error getting latest height: $e");
+        printV("Error getting latest height, using offline estimate: $e");
       }
       await ZcashWalletService.runInDbMutex(
         () async => await WarpApi.rescanFrom(coin, chainHeight - 150000),
@@ -536,6 +531,7 @@ abstract class ZcashWalletBase
   @action
   Future<void> _runWarpSync() async {
     Timer? _t;
+    bool shouldRetry = false;
     try {
       await warpSyncMutex.acquire();
       await initialSyncCheck();
@@ -548,19 +544,16 @@ abstract class ZcashWalletBase
           initialQueue = ZcashWalletService.dbMutexQueue;
           return;
         }
-        printV(
-          "Canceling sync! (ZcashWalletService.dbMutexQueue: ${ZcashWalletService.dbMutexQueue} > initialQueue: ${initialQueue})",
-        );
-        WarpApi.cancelSync();
+        // printV(
+        //   "Canceling sync! (ZcashWalletService.dbMutexQueue: ${ZcashWalletService.dbMutexQueue} > initialQueue: ${initialQueue})",
+        // );
+        // WarpApi.cancelSync();
         t.cancel();
         _t = null;
       }
 
-      unawaited(
-        Future.delayed(Duration(seconds: 2)).then((_) {
-          _t = Timer.periodic(Duration(milliseconds: 100), _cancelSyncIfShould);
-        }),
-      );
+      await Future.delayed(Duration(seconds: 2));
+      _t = Timer.periodic(Duration(milliseconds: 100), _cancelSyncIfShould);
       final result = await ZcashWalletService.runInDbMutex(
         () => WarpApi.warpSync(coin, accountId, true, 0, 1000000, 0),
       );
@@ -569,12 +562,16 @@ abstract class ZcashWalletBase
       await _updateSyncStatus();
     } catch (e) {
       syncStatus = FailedSyncStatus(error: e.toString());
-      unawaited(Future.delayed(Duration(seconds: 1)).then((_) => unawaited(_runWarpSync())));
-      _stopSyncStatusUpdates();
+      shouldRetry = true;
     } finally {
       isNodeWorking = false;
       warpSyncMutex.release();
       _t?.cancel();
+    }
+    if (shouldRetry) {
+      await Future.delayed(Duration(seconds: 1));
+      _stopSyncStatusUpdates();
+      await _runWarpSync();
     }
   }
 
@@ -720,19 +717,24 @@ abstract class ZcashWalletBase
   }
 
   static final autoShieldMutex = Mutex();
+  static late final appStartTime = DateTime.now();
   Future<void> _autoShield() async {
+    // let the app breethe
+    if (appStartTime.isBefore(DateTime.now().subtract(Duration(seconds: 25)))) {
+      return;
+    }
     try {
       await autoShieldMutex.acquire();
       await _$autoShield();
     } catch (e) {
       printV("shielding failed: $e");
-      await Future.delayed(Duration(seconds: 30));
     } finally {
       autoShieldMutex.release();
     }
   }
 
   Future<void> _$autoShield() async {
+    await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccountCache(coin, accountId));
     final chainHeight = await WarpApi.getLatestHeight(coin);
     final dbHeight = WarpApi.getDbHeight(coin);
     final height = dbHeight.unpack();
@@ -753,9 +755,8 @@ abstract class ZcashWalletBase
       amount: bpConfirmed.transparent + bpConfirmed.sapling,
     );
 
-    final recipient = Recipient(recipientBuilder.toBytes());
+    final recipient = Recipient.fromBytes(recipientBuilder.toBytes());
     final fee = FeeT(fee: 10000, minFee: 0, maxFee: 0, scheme: 0);
-    await ZcashWalletBase.loadProver();
     final txPlan = await ZcashWalletService.runInDbMutex(
       () => WarpApi.prepareTx(
         coin,
@@ -781,6 +782,7 @@ abstract class ZcashWalletBase
   @action
   Future<void> updateBalance() async {
     try {
+      await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccountCache(coin, accountId));
       final poolBalances = WarpApi.getPoolBalances(coin, accountId, 0, true);
       final balances = poolBalances.unpack();
       // final notes = WarpApi.getNotesSync(coin, accountId);
@@ -804,7 +806,7 @@ abstract class ZcashWalletBase
       });
       final confirmedSpendable = confirmedTotal - balances.transparent + knownOutPending;
 
-      unawaited(_autoShield());
+      await _autoShield();
 
       balance[CryptoCurrency.zec] = ZcashBalance(
         confirmed: confirmedSpendable,
@@ -841,12 +843,21 @@ abstract class ZcashWalletBase
       mnemonic = bip39.generateMnemonic(strength: strength);
     }
 
+    int birthHeight = await getBlockHeightByTime(DateTime.now());
+    try {
+      birthHeight = await ZcashWalletService.runInDbMutex(() => WarpApi.getLatestHeight(coin));
+    } catch (e) {
+      printV("Unable to fetch latest height for wallet creation, using offline estimate: $e");
+    }
+
     final accountId = await _restoreZcashWalletFromSeed(
       name: credentials.name,
       seed: mnemonic,
       passphrase: newWalletCredentials.passphrase,
+      birthHeight: birthHeight,
     );
     await _saveAccountId(credentials.name, accountId);
+    await storeZcashHeight(birthHeight);
     final wallet = await open(
       name: credentials.name,
       password: credentials.password!,
@@ -868,6 +879,7 @@ abstract class ZcashWalletBase
       name: credentials.name,
       seed: seed,
       passphrase: fromSeedCredentials.passphrase,
+      birthHeight: credentials.height,
     );
     await _saveAccountId(credentials.name, accountId);
     final wallet = await open(
@@ -879,12 +891,9 @@ abstract class ZcashWalletBase
     printV("height: ${credentials.height}");
     if (credentials.height != null) {
       await storeZcashHeight(credentials.height!);
-      unawaited(
-        Future.delayed(Duration(seconds: 2)).then(
-          (_) => ZcashWalletService.runInDbMutex(
-            () async => await WarpApi.rescanFrom(coin, credentials.height ?? 0),
-          ),
-        ),
+      await Future.delayed(Duration(seconds: 2));
+      await ZcashWalletService.runInDbMutex(
+        () async => await WarpApi.rescanFrom(coin, credentials.height ?? 0),
       );
     }
     return wallet;
@@ -907,6 +916,7 @@ abstract class ZcashWalletBase
       name: credentials.name,
       seed: keys,
       passphrase: fromKeysCredentials.passphrase,
+      birthHeight: credentials.height,
     );
     await _saveAccountId(credentials.name, accountId);
     final wallet = await open(
@@ -918,12 +928,9 @@ abstract class ZcashWalletBase
     printV("height: ${credentials.height}");
     if (credentials.height != null) {
       await storeZcashHeight(credentials.height!);
-      unawaited(
-        Future.delayed(Duration(seconds: 2)).then(
-          (_) => ZcashWalletService.runInDbMutex(
-            () async => await WarpApi.rescanFrom(coin, credentials.height ?? 0),
-          ),
-        ),
+      await Future.delayed(Duration(seconds: 2));
+      await ZcashWalletService.runInDbMutex(
+        () async => await WarpApi.rescanFrom(coin, credentials.height ?? 0),
       );
     }
     return wallet;
@@ -955,13 +962,14 @@ abstract class ZcashWalletBase
     required final String name,
     required String seed,
     required String? passphrase,
+    final int? birthHeight,
   }) async {
     if (passphrase?.isNotEmpty == true) {
       passphrase = passphrase!.replaceAll(" ", "_");
       seed = "${seed} ${passphrase}";
     }
     final accountId = await ZcashWalletService.runInDbMutex(
-      () => WarpApi.newAccount(coin, name, seed, 0),
+      () => WarpApi.newAccount(coin, name, seed, 0, birthHeight: birthHeight),
     );
     return accountId;
   }
@@ -970,6 +978,7 @@ abstract class ZcashWalletBase
     final wPath = await pathForWallet(name: name, type: _type);
     final f = File(wPath);
     if (!f.existsSync()) {
+      await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccounts(coin));
       final accounts = WarpApi.getAccountList(coin);
       for (final account in accounts) {
         if (account.name == name) {
@@ -1027,6 +1036,7 @@ abstract class ZcashWalletBase
   static String? _password;
   static Future<void> _init() async {
     if (_initialized) return;
+    await WarpApi.globalInit();
     dbDataPath = await getDbDataPath();
     printV("WarpApi.initWallet");
     if (_password == null) {
@@ -1035,56 +1045,18 @@ abstract class ZcashWalletBase
     if (!File(dbDataPath!).existsSync()) {
       //TODO(mrcyjanek): copy-encrypt
     }
-    // coin+1 = ycash
-    WarpApi.setDbPasswd(coin, '');
-    WarpApi.setDbPasswd(coin + 1, '');
     WarpApi.initWallet(coin, dbDataPath!);
-    WarpApi.initWallet(coin + 1, dbDataPath!);
+    await ZcashWalletService.runInDbMutex(() => WarpApi.refreshAccounts(coin));
     try {
       WarpApi.migrateData(coin);
-      WarpApi.migrateData(coin + 1);
     } catch (e) {
       printV("zec init failed: $e");
     } // do not fail on network exception
     await loadZcashHeight();
 
-    unawaited(loadProver());
-
     await ZcashTaddressRotation.init();
     await ZcashTransactionInfo.init();
     _initialized = true;
-  }
-
-  static bool isProverLoaded = false;
-  static Future<void> loadProver() async {
-    Uint8List? spend;
-    Uint8List? output;
-    final cacheDir = await getApplicationCacheDirectory();
-    try {
-      final spendBundle = await rootBundle.load('scripts/zcash_lib/assets/sapling-spend.params');
-      final outputBundle = await rootBundle.load('scripts/zcash_lib/assets/sapling-output.params');
-      spend = spendBundle.buffer.asUint8List();
-      output = outputBundle.buffer.asUint8List();
-      if (spend.length == 0 || output.length == 0) {
-        spend = await File(cacheDir.path + "/sapling-spend.params").readAsBytesSync();
-        output = await File(cacheDir.path + "/sapling-output.params").readAsBytesSync();
-      }
-      if (spend.length == 0 || output.length == 0) throw Exception("NUH UH");
-    } catch (e) {
-      printV("$e. Fine, I'll download them.");
-      final spendResponse = await ProxyWrapper().get(
-        clearnetUri: Uri.parse("https://download.z.cash/downloads/sapling-spend.params"),
-      );
-      final outputResponse = await ProxyWrapper().get(
-        clearnetUri: Uri.parse("https://download.z.cash/downloads/sapling-output.params"),
-      );
-      spend = spendResponse.bodyBytes;
-      output = outputResponse.bodyBytes;
-      await File(cacheDir.path + "/sapling-spend.params").writeAsBytes(spend);
-      await File(cacheDir.path + "/sapling-output.params").writeAsBytes(output);
-    }
-    WarpApi.initProver(spend, output);
-    isProverLoaded = true;
   }
 
   static Future<int> getBlockHeightByTime(final DateTime time) async {
@@ -1172,7 +1144,7 @@ abstract class ZcashWalletBase
       url: (lastNode!.isSSL ? 'https://' : 'http://') + lastNode!.uriRaw,
       height: (await loadZcashHeight()) ?? zashiAnnouncedBlockHeight,
     );
-    unawaited(zkoolSweep!.start());
+    await zkoolSweep!.start();
     int count = 0;
     Timer.periodic(Duration(milliseconds: 1000 ~/ 120), (final Timer t) {
       final msg = ZkoolSweep.msg;

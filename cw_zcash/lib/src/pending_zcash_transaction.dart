@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:cw_core/output_info.dart';
@@ -6,9 +5,7 @@ import 'package:cw_core/pending_transaction.dart';
 import 'package:cw_zcash/cw_zcash.dart';
 import 'package:cw_core/currency_for_wallet_type.dart';
 import 'package:cw_core/wallet_type.dart';
-import 'package:cw_zcash/src/zcash_taddress_rotation.dart';
-import 'package:warp_api/data_fb_generated.dart';
-import 'package:warp_api/warp_api.dart';
+import 'package:cw_zcash/src/warp_api_compat/legacy.dart';
 
 class PendingZcashTransaction with PendingTransaction {
   PendingZcashTransaction({
@@ -66,17 +63,12 @@ class PendingZcashTransaction with PendingTransaction {
     ZcashWalletBase.temporarySentTx[zcashWallet.accountId] ??= [];
     ZcashWalletBase.temporarySentTx[zcashWallet.accountId]?.add(
       ShieldedTx(
-        base64.decode(
-          ZcashTaddressRotation.flatBuffersPack(
-            ShieldedTxT(
-              id: Random().nextInt(pow(2, 32).toInt()),
-              txId: _txId,
-              height: 0,
-              timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-              value: -totalAmount,
-            ).pack,
-          ),
-        ),
+        id: Random().nextInt(pow(2, 32).toInt()),
+        txId: _txId,
+        shortTxId: (_txId ?? '').length >= 8 ? _txId!.substring(0, 8) : _txId,
+        height: 0,
+        timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        value: -totalAmount,
       ),
     );
     await ZcashTransactionInfo.addCachedDestinationAddress(
